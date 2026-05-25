@@ -229,7 +229,40 @@ void invert_omp(const uchar* src, uchar* dst, int w, int h, int ch) {
 }
 
 void invert_simd(const uchar* src, uchar* dst, int w, int h, int ch) {
-    std::memcpy(dst, src, w * h * ch);
+    size_t total = (size_t)w * h * ch;
+    size_t i = 0;
+
+    if (ch == 3) {
+        __m256i ones = _mm256_set1_epi8((char)0xFF);
+        for (; i + 32 <= total; i += 32) {
+            __m256i chunk = _mm256_loadu_si256((const __m256i*)(src + i));
+            __m256i result = _mm256_sub_epi8(ones, chunk);
+			_mm256_storeu_si256((__m256i*)(dst + i), result);
+        }
+    }
+    else {
+        __m256i ones_mask = _mm256_set_epi8(
+            0, -1, -1, -1, 0, -1, -1, -1, 0, -1, -1, -1, 0, -1, -1, -1,
+            0, -1, -1, -1, 0, -1, -1, -1, 0, -1, -1, -1, 0, -1, -1, -1);
+		__m256i ones = _mm256_set1_epi8((char)0xFF);
+        for (; i + 32 <= total; i += 32) {
+            __m256i chunk = _mm256_loadu_si256((const __m256i*)(src + i));
+            __m256i inv = _mm256_sub_epi8(ones, chunk);
+            __m256i result = _mm256_or_si256(
+                _mm256_and_si256(ones_mask, inv),
+                _mm256_andnot_si256(ones_mask, chunk));
+            _mm256_storeu_si256((__m256i*)(dst + i), result);
+        }
+    }
+
+    for (; i < total; i++) {
+		if (ch == 4 && (i % 4) == 3) {
+			dst[i] = src[i];
+		}
+		else {
+			dst[i] = 255 - src[i];
+		}
+    }
 }
 
 void invert_ocl(const uchar* src, uchar* dst, int w, int h, int ch, OCLCtx& ctx) {
@@ -393,17 +426,17 @@ int main() {
 
 
     median_seq(data, dst, width, height, channels);
-    if (!stbi_write_png("output_median.png", width, height, channels, dst, 90)) {
+    if (!stbi_write_png("output_median.png", width, height, channels, dst, width * channels)) {
         std::cout << "Ошибка сохранения output_median.png" << std::endl;
     }
 
     invert_seq(data, dst, width, height, channels);
-    if (!stbi_write_png("output_invert.png", width, height, channels, dst, 90)) {
+    if (!stbi_write_png("output_invert.png", width, height, channels, dst, width * channels)) {
         std::cout << "Ошибка сохранения output_invert.png" << std::endl;
     }
 
     edges_seq(data, dst, width, height, channels);
-    if (!stbi_write_png("output_edges.png", width, height, channels, dst, 90)) {
+    if (!stbi_write_png("output_edges.png", width, height, channels, dst, width * channels)) {
         std::cout << "Ошибка сохранения output_edges.png" << std::endl;
     }
 
