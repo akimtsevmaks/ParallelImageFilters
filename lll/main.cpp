@@ -187,7 +187,51 @@ void median_omp(const uchar* src, uchar* dst, int w, int h, int ch) {
 }
 
 void median_simd(const uchar* src, uchar* dst, int w, int h, int ch) {
-    std::memcpy(dst, src, w * h * ch);
+    std::memcpy(dst, src, (size_t)w * h * ch);
+    const int rowBytes = w * ch;
+
+#define MNMX(a, b) { __m256i _lo = _mm256_min_epu8(a, b); \
+                     (b) = _mm256_max_epu8(a, b); (a) = _lo; }
+
+    for (int y = 1; y < h - 1; y++) {
+        int base = (y * w + 1) * ch;
+        int endB = (y * w + (w - 1)) * ch;
+        int b = base;
+
+        for (; b + 32 <= endB; b += 32) {
+            __m256i p0 = _mm256_loadu_si256((const __m256i*)(src + b - rowBytes - ch));
+            __m256i p1 = _mm256_loadu_si256((const __m256i*)(src + b - rowBytes));
+            __m256i p2 = _mm256_loadu_si256((const __m256i*)(src + b - rowBytes + ch));
+            __m256i p3 = _mm256_loadu_si256((const __m256i*)(src + b - ch));
+            __m256i p4 = _mm256_loadu_si256((const __m256i*)(src + b));
+            __m256i p5 = _mm256_loadu_si256((const __m256i*)(src + b + ch));
+            __m256i p6 = _mm256_loadu_si256((const __m256i*)(src + b + rowBytes - ch));
+            __m256i p7 = _mm256_loadu_si256((const __m256i*)(src + b + rowBytes));
+            __m256i p8 = _mm256_loadu_si256((const __m256i*)(src + b + rowBytes + ch));
+
+            MNMX(p1, p2); MNMX(p4, p5); MNMX(p7, p8);
+            MNMX(p0, p1); MNMX(p3, p4); MNMX(p6, p7);
+            MNMX(p1, p2); MNMX(p4, p5); MNMX(p7, p8);
+            MNMX(p0, p3); MNMX(p5, p8); MNMX(p4, p7);
+            MNMX(p3, p6); MNMX(p1, p4); MNMX(p2, p5);
+            MNMX(p4, p7); MNMX(p4, p2); MNMX(p6, p4);
+            MNMX(p4, p2);
+
+            _mm256_storeu_si256((__m256i*)(dst + b), p4);
+        }
+
+        for (; b < endB; b++) {
+            uchar win[9] = {
+                src[b - rowBytes - ch], src[b - rowBytes], src[b - rowBytes + ch],
+                src[b - ch],            src[b],            src[b + ch],
+                src[b + rowBytes - ch], src[b + rowBytes], src[b + rowBytes + ch]
+            };
+            std::sort(win, win + 9);
+            dst[b] = win[4];
+        }
+    }
+
+#undef MNMX
 }
 
 void median_ocl(const uchar* src, uchar* dst, int w, int h, int ch, OCLCtx& ctx) {
@@ -352,7 +396,70 @@ void edges_omp(const uchar* src, uchar* dst, int w, int h, int ch) {
 }
 
 void edges_simd(const uchar* src, uchar* dst, int w, int h, int ch) {
-    std::memcpy(dst, src, w * h * ch);
+    std::vector<uchar> L(w * h + 16, 0);
+    for (int i = 0; i < w * h; i++) {
+        const uchar* p = &src[i * ch];
+        L[i] = (uchar)((p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8);
+    }
+
+    for (int i = 0; i < w * h; i++) {
+        dst[i * ch] = 0; dst[i * ch + 1] = 0; dst[i * ch + 2] = 0;
+        if (ch == 4) dst[i * ch + 3] = 255;
+    }
+
+    const __m256i v255 = _mm256_set1_epi16(255);
+
+    for (int y = 1; y < h - 1; y++) {
+        int x = 1;
+        for (; x + 16 <= w - 1; x += 16) {
+            int c = y * w + x;
+
+            auto ld = [&](int off) -> __m256i {
+                return _mm256_cvtepu8_epi16(
+                    _mm_loadu_si128((const __m128i*)(L.data() + c + off)));
+            };
+
+            __m256i tl = ld(-w - 1), tc = ld(-w), tr = ld(-w + 1);
+            __m256i ml = ld(-1), mr = ld(+1);
+            __m256i bl = ld(+w - 1), bc = ld(+w), br = ld(+w + 1);
+
+            __m256i gx = _mm256_add_epi16(
+                _mm256_sub_epi16(tr, tl),
+                _mm256_add_epi16(_mm256_slli_epi16(_mm256_sub_epi16(mr, ml), 1),
+                    _mm256_sub_epi16(br, bl)));
+
+            __m256i gy = _mm256_add_epi16(
+                _mm256_sub_epi16(bl, tl),
+                _mm256_add_epi16(_mm256_slli_epi16(_mm256_sub_epi16(bc, tc), 1),
+                    _mm256_sub_epi16(br, tr)));
+
+            __m256i mag = _mm256_add_epi16(_mm256_abs_epi16(gx), _mm256_abs_epi16(gy));
+            mag = _mm256_min_epu16(mag, v255);
+
+            alignas(32) uint16_t tmp[16];
+            _mm256_store_si256((__m256i*)tmp, mag);
+            for (int j = 0; j < 16; j++) {
+                int idx = (c + j) * ch;
+                uchar e = (uchar)tmp[j];
+                dst[idx] = e; dst[idx + 1] = e; dst[idx + 2] = e;
+            }
+        }
+
+        for (; x < w - 1; x++) {
+            auto lum = [&](int xx, int yy) -> int {
+                const uchar* p = &src[(yy * w + xx) * ch];
+                return (p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8;
+                };
+            int L00 = lum(x - 1, y - 1), L01 = lum(x, y - 1), L02 = lum(x + 1, y - 1);
+            int L10 = lum(x - 1, y), L12 = lum(x + 1, y);
+            int L20 = lum(x - 1, y + 1), L21 = lum(x, y + 1), L22 = lum(x + 1, y + 1);
+            int Gx = -L00 + L02 - 2 * L10 + 2 * L12 - L20 + L22;
+            int Gy = -L00 - 2 * L01 - L02 + L20 + 2 * L21 + L22;
+            int val = std::abs(Gx) + std::abs(Gy); if (val > 255) val = 255;
+            int idx = (y * w + x) * ch;
+            dst[idx] = val; dst[idx + 1] = val; dst[idx + 2] = val;
+        }
+    }
 }
 
 void edges_ocl(const uchar* src, uchar* dst, int w, int h, int ch, OCLCtx& ctx) {
