@@ -165,6 +165,25 @@ void median_seq(const uchar* src, uchar* dst, int w, int h, int ch) {
 
 void median_omp(const uchar* src, uchar* dst, int w, int h, int ch) {
     std::memcpy(dst, src, w * h * ch);
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int y = 1; y < h - 1; y++) {
+        for (int x = 1; x < w - 1; x++) {
+            for (int c = 0; c < ch; c++) {
+                uchar window[9];
+                int k = 0;
+
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        window[k++] = src[((y + dy) * w + (x + dx)) * ch + c];
+                    }
+                }
+
+                std::sort(window, window + 9);
+                dst[(y * w + x) * ch + c] = window[4];
+            }
+        }
+    }
 }
 
 void median_simd(const uchar* src, uchar* dst, int w, int h, int ch) {
@@ -192,7 +211,21 @@ void invert_seq(const uchar* src, uchar* dst, int w, int h, int ch) {
 }
 
 void invert_omp(const uchar* src, uchar* dst, int w, int h, int ch) {
-    std::memcpy(dst, src, w * h * ch);
+    int totalPixels = w * h;
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < totalPixels; i++) {
+        for (int c = 0; c < ch; c++) {
+            int idx = i * ch + c;
+
+            if (ch == 4 && c == 3) {
+                dst[idx] = src[idx];
+            }
+            else {
+                dst[idx] = 255 - src[idx];
+            }
+        }
+    }
 }
 
 void invert_simd(const uchar* src, uchar* dst, int w, int h, int ch) {
@@ -244,7 +277,45 @@ void edges_seq(const uchar* src, uchar* dst, int w, int h, int ch) {
 }
 
 void edges_omp(const uchar* src, uchar* dst, int w, int h, int ch) {
-    std::memcpy(dst, src, w * h * ch);
+    auto get_luminance = [&](int x, int y) -> int {
+        const uchar* p = &src[(y * w + x) * ch];
+        return (p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8;
+    };
+    
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < w * h; i++) {
+        dst[i * ch + 0] = 0;
+        dst[i * ch + 1] = 0;
+        dst[i * ch + 2] = 0;
+        if (ch == 4) dst[i * ch + 3] = 255;
+    }
+    
+    #pragma omp parallel for schedule(static)
+    for (int y = 1; y < h - 1; y++) {
+        for (int x = 1; x < w - 1; x++) {
+            int L00 = get_luminance(x - 1, y - 1);
+            int L01 = get_luminance(x, y - 1);
+            int L02 = get_luminance(x + 1, y - 1);
+
+            int L10 = get_luminance(x - 1, y);
+            int L12 = get_luminance(x + 1, y);
+
+            int L20 = get_luminance(x - 1, y + 1);
+            int L21 = get_luminance(x, y + 1);
+            int L22 = get_luminance(x + 1, y + 1);
+
+            int Gx = -L00 + L02 - 2 * L10 + 2 * L12 - L20 + L22;
+            int Gy = -L00 - 2 * L01 - L02 + L20 + 2 * L21 + L22;
+
+            int val = std::abs(Gx) + std::abs(Gy);
+            if (val > 255) val = 255;
+
+            int idx = (y * w + x) * ch;
+            dst[idx + 0] = val;
+            dst[idx + 1] = val;
+            dst[idx + 2] = val;
+        }
+    }
 }
 
 void edges_simd(const uchar* src, uchar* dst, int w, int h, int ch) {
