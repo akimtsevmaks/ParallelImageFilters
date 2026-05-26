@@ -1,23 +1,87 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
+﻿#define CL_USE_DEPRECATED_OPENCL_1_2_APIS
+#define _CRT_SECURE_NO_WARNINGS
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
-#include <iostream>
+
 #include <chrono>
-#include <string>
 #include <vector>
 #include <algorithm>
 #include <functional>
 #include <cmath>
 #include <immintrin.h>
 #include <omp.h>
-#define CL_HPP_TARGET_OPENCL_VERSION 200
-#include <CL/cl.h>
 #include <cstring>
 #include <iomanip>
+#include <iostream>
+
+#define CL_HPP_TARGET_OPENCL_VERSION 200
+#include <CL/cl.h>
+
 
 using uchar = unsigned char;
+
+
+static const char* OCL_SRC = R"(
+typedef unsigned char uchar;
+#define MNMX(a,b) { uchar _l = min(a, b); uchar _h = max(a, b); a = _l; b = _h; }
+ 
+__kernel void k_invert(__global const uchar* src, __global uchar* dst, int w, int h, int ch) {
+    int x = get_global_id(0), y = get_global_id(1);
+    if(x >= w || y >= h) return;
+    int base = (y * w + x) * ch;
+    for (int c = 0; c < (ch == 4 ? 3 : ch); c++) dst[base + c] = 255 - src[base + c];
+    if (ch == 4) dst[base + 3] = src[base + 3];
+}
+ 
+__kernel void k_median(__global const uchar* src, __global uchar* dst, int w, int h, int ch) {
+    int x = get_global_id(0), y = get_global_id(1);
+    if(x >= w || y >= h) return;
+    int base = (y * w + x) * ch;
+    if(x == 0 || x == w - 1 || y == 0 || y == h - 1) {
+        for(int c = 0; c < ch; c++) dst[base + c] = src[base + c]; return;
+    }
+    for(int c = 0; c < (ch == 4 ? 3 : ch); c++) {
+        uchar p0 = src[((y - 1) * w + (x - 1)) * ch + c], p1 = src[((y - 1) * w + x) * ch + c],
+              p2 = src[((y - 1) * w + (x + 1)) * ch + c], p3 = src[(y * w + (x - 1)) * ch + c],
+              p4 = src[(y * w + x) * ch + c], p5 = src[(y * w + (x + 1)) * ch + c],
+              p6 = src[((y + 1) * w + (x - 1)) * ch + c], p7 = src[((y + 1) * w + x) * ch + c],
+              p8 = src[((y + 1) * w + (x + 1)) * ch + c];
+        MNMX(p1, p2); MNMX(p4, p5); MNMX(p7, p8);
+        MNMX(p0, p1); MNMX(p3, p4); MNMX(p6, p7);
+        MNMX(p1, p2); MNMX(p4, p5); MNMX(p7, p8);
+        MNMX(p0, p3); MNMX(p5, p8); MNMX(p4, p7);
+        MNMX(p3, p6); MNMX(p1, p4); MNMX(p2, p5);
+        MNMX(p4, p7); MNMX(p4, p2); MNMX(p6, p4); MNMX(p4, p2);
+        dst[base + c] = p4;
+    }
+    if(ch == 4) dst[base + 3] = src[base + 3];
+}
+ 
+__kernel void k_edges(__global const uchar* src, __global uchar* dst, int w, int h, int ch) {
+    int x = get_global_id(0), y = get_global_id(1);
+    if (x >= w || y >= h) return;
+    int base = (y * w + x) * ch;
+    if (x == 0 || x == w - 1 || y == 0 || y == h - 1) {
+        for (int c = 0; c < ch; c++) dst[base + c] = 0;
+        if (ch == 4) dst[base + 3] = 255; return;
+    }
+    #define LUM(px, py) \
+        ((src[((py) * w + (px)) * ch] * 77 + src[((py) * w + (px)) * ch + 1] * 150 + src[((py) * w + (px)) * ch + 2] * 29) >> 8)
+    int L00 = LUM(x - 1, y - 1), L01 = LUM(x, y - 1), L02 = LUM(x + 1, y - 1);
+    int L10 = LUM(x - 1, y), L12 = LUM(x + 1, y);
+    int L20 = LUM(x - 1, y + 1), L21 = LUM(x, y + 1), L22 = LUM(x + 1, y + 1);
+    int Gx = -L00 + L02 - 2 * L10 + 2 * L12 - L20 + L22;
+    int Gy = -L00 - 2 * L01 - L02 + L20 + 2 * L21 + L22;
+    int val = abs(Gx) + abs(Gy);
+    if (val > 255) val = 255;
+    for (int c = 0; c < (ch == 4 ? 3 : ch); c++) dst[base + c] = (uchar)val;
+    if (ch == 4) dst[base + 3] = 255;
+    #undef LUM
+}
+#undef MNMX
+)";
 
 
 struct OCLCtx {
@@ -25,6 +89,12 @@ struct OCLCtx {
 	cl_device_id device = nullptr;
 	cl_context context = nullptr;
     cl_command_queue queue = nullptr;
+
+    cl_program program = nullptr;
+    cl_kernel k_invert = nullptr;
+    cl_kernel k_median = nullptr;
+    cl_kernel k_edges = nullptr;
+
     bool isValid = false;
 };
 
@@ -32,105 +102,118 @@ struct OCLCtx {
 OCLCtx init_opencl() {
 	OCLCtx ctx;
 	cl_uint numPlatforms = 0;
-	cl_int err = clGetPlatformIDs(0, nullptr, &numPlatforms);
 
-    if (err != CL_SUCCESS || numPlatforms == 0) {
-		std::cout << "Ошибка получения платформ OpenCL" << std::endl;
-		return ctx;
-    }
+    if (clGetPlatformIDs(0, nullptr, &numPlatforms) != CL_SUCCESS || numPlatforms == 0) return ctx;
 
 	std::vector<cl_platform_id> platforms(numPlatforms);
 	clGetPlatformIDs(numPlatforms, platforms.data(), nullptr);
 
 	cl_device_id selectedDevice = nullptr; 
 	cl_platform_id selectedPlatform = nullptr;
-	bool deviceFound = false;
 
-    auto findDevice = [&](cl_device_type type, bool forceIntel) -> bool {
+    auto findDevice = [&](cl_device_type type, bool IntelOnly) -> bool {
         for (auto p : platforms) {
-            if (forceIntel) {
-                char vendor[256] = { 0 };
-                clGetPlatformInfo(p, CL_PLATFORM_NAME, sizeof(vendor), vendor, nullptr);
-                if (std::string(vendor).find("Intel") == std::string::npos) {
-                    continue;
-                }
+            if (IntelOnly) {
+                char name[256] = { 0 };
+                clGetPlatformInfo(p, CL_PLATFORM_NAME, sizeof(name), name, nullptr);
+                if (std::string(name).find("Intel") == std::string::npos) continue;
             }
 
             cl_uint numDevices = 0;
-            cl_uint devErr = clGetDeviceIDs(p, type, 0, nullptr, &numDevices);
 
-            if (devErr == CL_SUCCESS && numDevices > 0) {
-                std::vector<cl_device_id> devices(numDevices);
-                clGetDeviceIDs(p, type, numDevices, devices.data(), nullptr);
-                selectedDevice = devices[0];
-                selectedPlatform = p;
-                return true;
-            }
+            if (clGetDeviceIDs(p, type, 0, nullptr, &numDevices) != CL_SUCCESS || numDevices == 0) continue;
+
+            std::vector<cl_device_id> devices(numDevices);
+            clGetDeviceIDs(p, type, numDevices, devices.data(), nullptr);
+
+            selectedDevice = devices[0];
+            selectedPlatform = p;
+            return true;
         }
         return false;
     };
 
-    if (findDevice(CL_DEVICE_TYPE_GPU, true)) {
-        deviceFound = true;
-    }
-	else if (findDevice(CL_DEVICE_TYPE_CPU, true)) {
-		deviceFound = true;
-	}
-	else if (findDevice(CL_DEVICE_TYPE_GPU, false)) {
-		deviceFound = true;
-	}
-	else if (findDevice(CL_DEVICE_TYPE_CPU, false)) {
-		deviceFound = true;
-	}
-
-	if (!deviceFound) {
-		std::cout << "Не найдено подходящее устройство OpenCL" << std::endl;
-		return ctx;
-	}
-
+    if (!findDevice(CL_DEVICE_TYPE_GPU, true) && !findDevice(CL_DEVICE_TYPE_CPU, true) &&
+        !findDevice(CL_DEVICE_TYPE_GPU, false) && !findDevice(CL_DEVICE_TYPE_CPU, false)) return ctx;
+        
 	ctx.platform = selectedPlatform;
 	ctx.device = selectedDevice;
 
+    cl_int err;
 	ctx.context = clCreateContext(nullptr, 1, &ctx.device, nullptr, nullptr, &err);
-    if (err != CL_SUCCESS) {
-		std::cout << "Ошибка создания контекста OpenCL" << std::endl;
-		return ctx;
-    }
+    if (err != CL_SUCCESS) return ctx;
 
 	ctx.queue = clCreateCommandQueueWithProperties(ctx.context, ctx.device, 0, &err);
-    if (err != CL_SUCCESS) {
-		ctx.queue = clCreateCommandQueue(ctx.context, ctx.device, 0, &err);
-    }
+    if (err != CL_SUCCESS) ctx.queue = clCreateCommandQueue(ctx.context, ctx.device, 0, &err);
 
     if (err != CL_SUCCESS) {
-		std::cout << "Ошибка создания очереди OpenCL" << std::endl;
-		clReleaseContext(ctx.context);
+        clReleaseContext(ctx.context);
         ctx.context = nullptr;
         return ctx;
     }
 
 	ctx.isValid = true;
-
-	char deviceName[256] = { 0 };
-	clGetDeviceInfo(ctx.device, CL_DEVICE_NAME, sizeof(deviceName), deviceName, nullptr);
-
-	cl_ulong localMemSize = 0;
-	clGetDeviceInfo(ctx.device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(localMemSize), &localMemSize, nullptr);
-
-	size_t maxWorkGroupSize = 0;
-	clGetDeviceInfo(ctx.device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(maxWorkGroupSize), &maxWorkGroupSize, nullptr);
-
-	std::cout << "Выбранное устройство: " << deviceName << std::endl;
-	std::cout << "Локальная память: " << localMemSize / 1024 << " KB" << std::endl;
-	std::cout << "Макс. размер рабочей группы: " << maxWorkGroupSize << std::endl;
-
     return ctx;
 }
 
-double measure_ms(std::function<void()> fn, int runs = 5) {
-    if (runs <= 0) return 0.0;
+bool build_ocl_kernels(OCLCtx& ctx) {
+    if (!ctx.isValid) return false;
 
+    cl_int err;
+    ctx.program = clCreateProgramWithSource(ctx.context, 1, &OCL_SRC, nullptr, &err);
+    if (err != CL_SUCCESS) return false;
+
+    err = clBuildProgram(ctx.program, 1, &ctx.device, nullptr, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        size_t sz = 0;
+        clGetProgramBuildInfo(ctx.program, ctx.device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &sz);
+        std::string log(sz, ' ');
+        clGetProgramBuildInfo(ctx.program, ctx.device, CL_PROGRAM_BUILD_LOG, sz, log.data(), nullptr);
+        std::cout << "Ошибка:\n" << log << "\n"; return false;
+    }
+
+    ctx.k_invert = clCreateKernel(ctx.program, "k_invert", &err);
+    ctx.k_median = clCreateKernel(ctx.program, "k_median", &err);
+    ctx.k_edges = clCreateKernel(ctx.program, "k_edges", &err);
+    return err == CL_SUCCESS;
+}
+
+void release_opencl(OCLCtx& ctx) {
+    if (ctx.k_edges) clReleaseKernel(ctx.k_edges);
+    if (ctx.k_median) clReleaseKernel(ctx.k_median);
+    if (ctx.k_invert) clReleaseKernel(ctx.k_invert);
+    if (ctx.program) clReleaseProgram(ctx.program);
+    if (ctx.queue) clReleaseCommandQueue(ctx.queue);
+    if (ctx.context) clReleaseContext(ctx.context);
+}
+
+size_t round_up(size_t n, size_t m) { return ((n + m - 1) / m) * m; }
+
+
+static void run_kernel(cl_kernel kernel, const uchar* src, uchar* dst, int w, int h, int ch, OCLCtx& ctx) {
+    size_t imgSize = (size_t)w * h * ch;
+    cl_int err;
+
+    cl_mem bufSrc = clCreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, imgSize, (void*)src, &err);
+    cl_mem bufDst = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR, imgSize, dst, &err);
+    cl_int W = w, H = h, CH = ch;
+
+    clSetKernelArg(kernel, 0, sizeof(cl_mem), &bufSrc);
+    clSetKernelArg(kernel, 1, sizeof(cl_mem), &bufDst);
+    clSetKernelArg(kernel, 2, sizeof(cl_int), &W);
+    clSetKernelArg(kernel, 3, sizeof(cl_int), &H);
+    clSetKernelArg(kernel, 4, sizeof(cl_int), &CH);
+
+    size_t global[2] = { round_up(w , 16), round_up(h, 16) }, local[2] = { 16, 16 };
+    clEnqueueNDRangeKernel(ctx.queue, kernel, 2, nullptr, global, local, 0, nullptr, nullptr);
+    clFinish(ctx.queue);
+    clReleaseMemObject(bufSrc);
+    clReleaseMemObject(bufDst);
+}
+
+double measure_ms(std::function<void()> fn, int runs = 5) {
     auto start = std::chrono::high_resolution_clock::now();
+
     for (int i = 0; i < runs; i++) {
         fn();
     }
@@ -235,7 +318,8 @@ void median_simd(const uchar* src, uchar* dst, int w, int h, int ch) {
 }
 
 void median_ocl(const uchar* src, uchar* dst, int w, int h, int ch, OCLCtx& ctx) {
-    std::memcpy(dst, src, w * h * ch);
+    if (!ctx.isValid || !ctx.k_median) { std::memcpy(dst, src, (size_t)w * h * ch); return; }
+    run_kernel(ctx.k_median, src, dst, w, h, ch, ctx);
 }
 
 void invert_seq(const uchar* src, uchar* dst, int w, int h, int ch) {
@@ -310,7 +394,8 @@ void invert_simd(const uchar* src, uchar* dst, int w, int h, int ch) {
 }
 
 void invert_ocl(const uchar* src, uchar* dst, int w, int h, int ch, OCLCtx& ctx) {
-    std::memcpy(dst, src, w * h * ch);
+    if (!ctx.isValid || !ctx.k_invert) { std::memcpy(dst, src, (size_t)w * h * ch); return; }
+    run_kernel(ctx.k_invert, src, dst, w, h, ch, ctx);
 }
 
 void edges_seq(const uchar* src, uchar* dst, int w, int h, int ch) {
@@ -403,7 +488,9 @@ void edges_simd(const uchar* src, uchar* dst, int w, int h, int ch) {
     }
 
     for (int i = 0; i < w * h; i++) {
-        dst[i * ch] = 0; dst[i * ch + 1] = 0; dst[i * ch + 2] = 0;
+        dst[i * ch] = 0;
+        dst[i * ch + 1] = 0;
+        dst[i * ch + 2] = 0;
         if (ch == 4) dst[i * ch + 3] = 255;
     }
 
@@ -420,8 +507,8 @@ void edges_simd(const uchar* src, uchar* dst, int w, int h, int ch) {
             };
 
             __m256i tl = ld(-w - 1), tc = ld(-w), tr = ld(-w + 1);
-            __m256i ml = ld(-1), mr = ld(+1);
-            __m256i bl = ld(+w - 1), bc = ld(+w), br = ld(+w + 1);
+            __m256i ml = ld(-1), mr = ld(1);
+            __m256i bl = ld(w - 1), bc = ld(w), br = ld(w + 1);
 
             __m256i gx = _mm256_add_epi16(
                 _mm256_sub_epi16(tr, tl),
@@ -450,12 +537,17 @@ void edges_simd(const uchar* src, uchar* dst, int w, int h, int ch) {
                 const uchar* p = &src[(yy * w + xx) * ch];
                 return (p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8;
                 };
+
             int L00 = lum(x - 1, y - 1), L01 = lum(x, y - 1), L02 = lum(x + 1, y - 1);
             int L10 = lum(x - 1, y), L12 = lum(x + 1, y);
             int L20 = lum(x - 1, y + 1), L21 = lum(x, y + 1), L22 = lum(x + 1, y + 1);
+
             int Gx = -L00 + L02 - 2 * L10 + 2 * L12 - L20 + L22;
             int Gy = -L00 - 2 * L01 - L02 + L20 + 2 * L21 + L22;
-            int val = std::abs(Gx) + std::abs(Gy); if (val > 255) val = 255;
+
+            int val = std::abs(Gx) + std::abs(Gy);
+            if (val > 255) val = 255;
+
             int idx = (y * w + x) * ch;
             dst[idx] = val; dst[idx + 1] = val; dst[idx + 2] = val;
         }
@@ -463,98 +555,87 @@ void edges_simd(const uchar* src, uchar* dst, int w, int h, int ch) {
 }
 
 void edges_ocl(const uchar* src, uchar* dst, int w, int h, int ch, OCLCtx& ctx) {
-    std::memcpy(dst, src, w * h * ch);
+    if (!ctx.isValid || !ctx.k_edges) { std::memcpy(dst, src, (size_t)w * h * ch); return; }
+    run_kernel(ctx.k_edges, src, dst, w, h, ch, ctx);
 }
 
 
 int main() {
     setlocale(LC_ALL, "Russian");
 
+    const char* imgPath = "input2400.png";
+
     OCLCtx ctx = init_opencl();
+    build_ocl_kernels(ctx);
 
     int width = 0, height = 0, channels = 0;
-    unsigned char* data = stbi_load("input.png", &width, &height, &channels, 0);
-    if (!data) {
-        std::cout << "Ошибка загрузки изображения" << std::endl;
-        if (ctx.isValid) {
-            clReleaseCommandQueue(ctx.queue);
-			clReleaseContext(ctx.context);
-        }
-        return 1;
-    }
+    uchar* src = stbi_load(imgPath, &width, &height, &channels, 0);
+    if (!src) { release_opencl(ctx); return 1; }
 
+    uchar* dst = new uchar[width * height * channels];
 
-	size_t imgSize = static_cast<size_t>(width) * height * channels;
-    uchar* dst = new uchar[imgSize];
+    invert_seq(src, dst, width, height, channels);
 
-    double t_med_seq = measure_ms([&]() { median_seq(data, dst, width, height, channels); });
-    double t_med_omp = measure_ms([&]() { median_omp(data, dst, width, height, channels); });
-    double t_med_simd = measure_ms([&]() { median_simd(data, dst, width, height, channels); });
-    double t_med_ocl = measure_ms([&]() { median_ocl(data, dst, width, height, channels, ctx); });
+    struct Row { const char* name; double s, o, si, cl; };
+    Row rows[3];
 
-    double t_inv_seq = measure_ms([&]() { invert_seq(data, dst, width, height, channels); });
-    double t_inv_omp = measure_ms([&]() { invert_omp(data, dst, width, height, channels); });
-    double t_inv_simd = measure_ms([&]() { invert_simd(data, dst, width, height, channels); });
-    double t_inv_ocl = measure_ms([&]() { invert_ocl(data, dst, width, height, channels, ctx); });
+    rows[0] = { "Инверсия",
+        measure_ms([&] {invert_seq(src, dst, width, height, channels); }, 5),
+        measure_ms([&] {invert_omp(src, dst, width, height, channels); }, 5),
+        measure_ms([&] {invert_simd(src, dst, width, height, channels); }, 5),
+        measure_ms([&] {invert_ocl(src, dst, width, height, channels, ctx); }, 5) };
 
-    double t_edges_seq = measure_ms([&]() { edges_seq(data, dst, width, height, channels); });
-    double t_edges_omp = measure_ms([&]() { edges_omp(data, dst, width, height, channels); });
-    double t_edges_simd = measure_ms([&]() { edges_simd(data, dst, width, height, channels); });
-    double t_edges_ocl = measure_ms([&]() { edges_ocl(data, dst, width, height, channels, ctx); });
+    rows[1] = { "Медиана",
+        measure_ms([&] {median_seq(src, dst, width, height, channels); }, 5),
+        measure_ms([&] {median_omp(src, dst, width, height, channels); }, 5),
+        measure_ms([&] {median_simd(src, dst, width, height, channels); }, 5),
+        measure_ms([&] {median_ocl(src, dst, width, height, channels, ctx); }, 5) };
 
+    rows[2] = { "Границы",
+        measure_ms([&] {edges_seq(src, dst, width, height, channels); }, 5),
+        measure_ms([&] {edges_omp(src, dst, width, height, channels); }, 5),
+        measure_ms([&] {edges_simd(src, dst, width, height, channels); }, 5),
+        measure_ms([&] {edges_ocl(src, dst, width, height, channels, ctx); }, 5) };
 
-    std::cout << std::left << std::setw(25) << "Фильтр"
-        << " | " << std::setw(10) << "seq, мс"
-        << " | " << std::setw(10) << "omp, мс"
-        << " | " << std::setw(10) << "simd, мс"
-        << " | " << std::setw(10) << "ocl, мс" << std::endl;
-    std::cout << std::string(70, '-') << std::endl;
+    const int W1 = 12, W2 = 10, W3 = 10, W4 = 10, W5 = 9;
+
+    std::cout << std::left
+        << std::setw(W1) << "Фильтр"
+        << std::setw(W2) << "seq, мс"
+        << std::setw(W3) << "omp, мс"
+        << std::setw(W4) << "simd, мс"
+        << std::setw(W5) << "ocl, мс"
+        << std::setw(W5) << "х omp"
+        << std::setw(W5) << "х simd"
+        << std::setw(W5) << "х ocl" << "\n";
 
     std::cout << std::fixed << std::setprecision(3);
-    std::cout << std::left << std::setw(25) << "Медианный фильтр"
-        << " | " << std::setw(10) << t_med_seq
-        << " | " << std::setw(10) << t_med_omp
-        << " | " << std::setw(10) << t_med_simd
-        << " | " << std::setw(10) << t_med_ocl << std::endl;
-
-    std::cout << std::left << std::setw(25) << "Инверсия цвета"
-        << " | " << std::setw(10) << t_inv_seq
-        << " | " << std::setw(10) << t_inv_omp
-        << " | " << std::setw(10) << t_inv_simd
-        << " | " << std::setw(10) << t_inv_ocl << std::endl;
-
-    std::cout << std::left << std::setw(25) << "Обнаружение границ"
-        << " | " << std::setw(10) << t_edges_seq
-        << " | " << std::setw(10) << t_edges_omp
-        << " | " << std::setw(10) << t_edges_simd
-        << " | " << std::setw(10) << t_edges_ocl << std::endl;
-
-    std::cout << std::endl;
-
-
-    median_seq(data, dst, width, height, channels);
-    if (!stbi_write_png("output_median.png", width, height, channels, dst, width * channels)) {
-        std::cout << "Ошибка сохранения output_median.png" << std::endl;
+    for (auto& r : rows) {
+        std::cout << std::left
+            << std::setw(W1) << r.name
+            << std::setw(W2) << r.s
+            << std::setw(W3) << r.o
+            << std::setw(W4) << r.si
+            << std::setw(W5) << r.cl
+            << std::setprecision(2)
+            << std::setw(W5) << r.s / r.o
+            << std::setw(W5) << r.s / r.si
+            << std::setw(W5) << r.s / r.cl
+            << "\n";
+        std::cout << std::setprecision(3);
     }
 
-    invert_seq(data, dst, width, height, channels);
-    if (!stbi_write_png("output_invert.png", width, height, channels, dst, width * channels)) {
-        std::cout << "Ошибка сохранения output_invert.png" << std::endl;
-    }
+    median_seq(src, dst, width, height, channels);
+    stbi_write_png("output_median.png", width, height, channels, dst, width * channels);
 
-    edges_seq(data, dst, width, height, channels);
-    if (!stbi_write_png("output_edges.png", width, height, channels, dst, width * channels)) {
-        std::cout << "Ошибка сохранения output_edges.png" << std::endl;
-    }
+    invert_seq(src, dst, width, height, channels);
+    stbi_write_png("output_invert.png", width, height, channels, dst, width * channels);
 
-    if (ctx.isValid) {
-		clReleaseCommandQueue(ctx.queue);
-		clReleaseContext(ctx.context);
-    }
+    edges_seq(src, dst, width, height, channels);
+    stbi_write_png("output_edges.png", width, height, channels, dst, width * channels);
 
-    stbi_image_free(data);
+    stbi_image_free(src);
     delete[] dst;
-
+    release_opencl(ctx);
     return 0;
-
 }
